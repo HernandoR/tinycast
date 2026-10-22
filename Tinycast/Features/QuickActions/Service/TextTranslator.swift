@@ -34,78 +34,63 @@ enum TextTranslator {
         return Locale.Language(identifier: dominant.rawValue)
     }
 
-    /// What a pair can do here, because `.supported` and `.unsupported` mean different prompts.
-    enum PairAvailability {
-        case installed(source: Locale.Language, target: Locale.Language)
-        case missing
-        case unsupported
-    }
-
     /// Installed pairs only: a missing language is downloaded in System Settings, never from here.
     static func translate(_ text: String, to target: Locale.Language) async throws -> String {
         guard let source = sourceLanguage(of: text) else { throw Failure.undetectableSource }
         guard !source.isEquivalent(to: target) else { return text }
-        switch await pairAvailability(from: source, to: target) {
-        case .installed(let installedSource, let installedTarget):
-            do {
-                let session = TranslationSession(
-                    installedSource: installedSource, target: installedTarget)
-                return try await session.translate(text).targetText
-            } catch {
-                throw Failure.failed
-            }
-        case .missing:
-            let missing = await missingLanguage(from: source, to: target)
-            throw Failure.notInstalled(language: displayName(of: missing))
+        let availability = LanguageAvailability()
+        switch await availability.status(from: source, to: target) {
+        case .installed:
+            return try await translate(text, from: source, to: target)
+        case .supported:
+            break
         case .unsupported:
             throw Failure.unsupported
+        @unknown default:
+            throw Failure.unsupported
+        }
+        let supported = await availability.supportedLanguages
+        let sources = variants(of: source, among: supported)
+        let targets = variants(of: target, among: supported)
+        if let pair = await installedPair(sources, targets, availability) {
+            return try await translate(text, from: pair.source, to: pair.target)
+        }
+        // Every source spelling already failed, so only a third language can prove the target.
+        let partners = supported.filter {
+            $0.languageCode != source.languageCode && $0.languageCode != target.languageCode
+        }
+        let targetIsInstalled = await installedPair(partners, targets, availability) != nil
+        throw Failure.notInstalled(language: displayName(of: targetIsInstalled ? source : target))
+    }
+
+    private static func translate(
+        _ text: String, from source: Locale.Language, to target: Locale.Language
+    ) async throws -> String {
+        do {
+            let session = TranslationSession(installedSource: source, target: target)
+            return try await session.translate(text).targetText
+        } catch {
+            throw Failure.failed
         }
     }
 
-    /// A download is a locale, so the case a bare code resolves to can miss the one installed.
-    static func pairAvailability(
-        from source: Locale.Language, to target: Locale.Language
-    ) async -> PairAvailability {
-        let availability = LanguageAvailability()
-        let supported = await availability.supportedLanguages
-        var supportedPair = false
-        for sourceVariant in variants(of: source, among: supported) {
-            for targetVariant in variants(of: target, among: supported) {
-                let status = await availability.status(from: sourceVariant, to: targetVariant)
-                if status == .installed {
-                    return .installed(source: sourceVariant, target: targetVariant)
-                }
-                if status == .supported { supportedPair = true }
-            }
-        }
-        return supportedPair ? .missing : .unsupported
-    }
-
-    /// The prompt names one language, so it has to name the side that is actually missing.
-    static func missingLanguage(
-        from source: Locale.Language, to target: Locale.Language
-    ) async -> Locale.Language {
-        if await isInstalled(target) { return source }
-        return target
-    }
-
-    /// An installed language pairs with something, so a working partner is proof it is downloaded.
-    static func isInstalled(_ language: Locale.Language) async -> Bool {
-        let availability = LanguageAvailability()
-        let supported = await availability.supportedLanguages
-        let candidates = variants(of: language, among: supported)
-        for partner in supported where partner.languageCode != language.languageCode {
-            for candidate in candidates {
-                if await availability.status(from: partner, to: candidate) == .installed {
-                    return true
+    /// A download is a locale, so the region a bare code resolves to can miss the one installed.
+    private static func installedPair(
+        _ sources: [Locale.Language], _ targets: [Locale.Language],
+        _ availability: LanguageAvailability
+    ) async -> (source: Locale.Language, target: Locale.Language)? {
+        for source in sources {
+            for target in targets {
+                if await availability.status(from: source, to: target) == .installed {
+                    return (source, target)
                 }
             }
         }
-        return false
+        return nil
     }
 
     /// Region may move, since one English is another's asset, but a different script is a language.
-    static func variants(
+    private static func variants(
         of language: Locale.Language, among supported: [Locale.Language]
     ) -> [Locale.Language] {
         [language]
